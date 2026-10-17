@@ -1,0 +1,53 @@
+--- a/src/prim/unix/prim.c
++++ b/src/prim/unix/prim.c
+@@ -218,9 +218,50 @@
+   return p;
+ }
+ 
++#if defined(MI_BB_LOW_BASE) && defined(MI_BB_LOW_END)
++// bbport (macOS): PS4 code packs host pointers (thread handles, mutexes, TLS) into 40-bit fields,
++// so every heap block must lie below 1 TiB. All OS memory of the allocator comes from the window
++// [MI_BB_LOW_BASE, MI_BB_LOW_END): a bump pointer hands out aligned hints (mmap without MAP_FIXED
++// never replaces an existing mapping), and starts over at the base once the window was walked,
++// so ranges given back to the OS are reused.
++static _Atomic(uintptr_t) mi_bb_low_next = MI_BB_LOW_BASE;
++static void* mi_bb_low_mmap(size_t size, size_t try_alignment, int protect_flags, int flags, int fd) {
++  const uintptr_t base = (uintptr_t)MI_BB_LOW_BASE, end = (uintptr_t)MI_BB_LOW_END;
++  size_t align = _mi_os_page_size();
++  if (try_alignment > align && (try_alignment & (try_alignment - 1)) == 0) align = try_alignment;
++  if (size == 0 || size > end - base) return NULL;
++  for (int round = 0; round < 2; round++) {
++    for (;;) {
++      uintptr_t cur = mi_atomic_load_relaxed(&mi_bb_low_next);
++      const uintptr_t start = _mi_align_up(cur < base ? base : cur, align);
++      if (start < base || start > end || size > end - start) break;
++      if (!mi_atomic_cas_weak_acq_rel(&mi_bb_low_next, &cur, start + size)) continue;
++      void* p = unix_mmap_prim((void*)start, size, protect_flags, flags, fd);
++      if (p == MAP_FAILED) continue;
++      const uintptr_t at = (uintptr_t)p;
++      if (at >= base && at <= end && size <= end - at && _mi_is_aligned(p, align)) return p;
++      munmap(p, size);
++    }
++    uintptr_t cur = mi_atomic_load_relaxed(&mi_bb_low_next);
++    mi_atomic_cas_strong_acq_rel(&mi_bb_low_next, &cur, base);
++  }
++  return NULL;
++}
++#endif
++
+ static void* unix_mmap_prim_aligned(void* addr, size_t size, size_t try_alignment, int protect_flags, int flags, int fd) {
+   MI_UNUSED(try_alignment);
+   void* p = NULL;
++  #if defined(MI_BB_LOW_BASE) && defined(MI_BB_LOW_END)
++  if (addr == NULL) {
++    p = mi_bb_low_mmap(size, try_alignment, protect_flags, flags, fd);
++    if (p != NULL) return p;
++    static _Atomic(size_t) mi_bb_low_warned;
++    if (mi_atomic_increment_relaxed(&mi_bb_low_warned) == 0) {
++      _mi_warning_message("bbport: the low heap window is full; heap memory above 1 TiB from now on (0x%zx bytes requested)\n", size);
++    }
++  }
++  #endif
+   #if defined(MAP_ALIGNED)  // BSD
+   if (addr == NULL && try_alignment > 1 && (try_alignment % _mi_os_page_size()) == 0) {
+     size_t n = mi_bsr(try_alignment);
